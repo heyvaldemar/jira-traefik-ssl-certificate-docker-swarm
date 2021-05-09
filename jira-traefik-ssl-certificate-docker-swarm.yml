@@ -1,0 +1,189 @@
+# Jira with SSL Certificate in a Docker Swarm
+
+# Vladimir Mikhalev
+# callvaldemar@gmail.com
+# www.heyvaldemar.com
+
+# Configure Traefik and create secrets for storing the passwords on the Docker Swarm manager node before applying the configuration.
+# Traefik configuration: https://github.com/heyValdemar/traefik-ssl-certificate-docker-swarm
+
+# Create a secret for storing the password for Jira database using the command:
+# printf "YourPassword" | docker secret create jira-postgres-password -
+
+# Clear passwords from bash history using the command:
+# history -c && history -w
+
+# Run jira-restore-application-data.sh on the Docker Swarm worker node where the container for backups is running to restore application data if needed.
+# Run jira-restore-database.sh on the Docker Swarm node where the container for backups is running to restore database if needed.
+# Run docker stack ps jira | grep jira_backups | awk 'NR > 0 {print $4}' on the Docker Swarm manager node to find on which node container for backups is running.
+
+# Deploy Jira in a Docker Swarm using the command:
+# docker stack deploy -c jira-traefik-ssl-certificate-docker-swarm.yml jira
+
+version: '3.8'
+
+x-default-opts:
+  &default-opts
+  logging:
+    options:
+      max-size: "10m"
+
+networks:
+  jira-network:
+    driver: overlay
+  traefik-network:
+    external: true
+
+volumes:
+  jira-data:
+  jira-postgres:
+  jira-data-backups:
+  jira-postgres-backups:
+
+secrets:
+  jira-postgres-password:
+    external: true
+
+services:
+  postgres:
+    <<: *default-opts
+    # Image tag (replace with yours)
+    image: postgres:11.11
+    volumes:
+      - jira-postgres:/var/lib/postgresql/data
+    environment:
+      # Database name (replace with yours)
+      POSTGRES_DB: jiradb
+      # Database user (replace with yours)
+      POSTGRES_USER: jiradbuser
+      POSTGRES_PASSWORD_FILE: /run/secrets/jira-postgres-password
+    networks:
+      - jira-network
+    secrets:
+      - jira-postgres-password
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == worker
+      # Container resources (replace with yours)
+      resources:
+        limits:
+          cpus: '0.55'
+          memory: 1G
+        reservations:
+          cpus: '0.35'
+          memory: 512M
+
+  jira:
+    <<: *default-opts
+    # Image tag (replace with yours)
+    image: atlassian/jira-software:8.16-jdk11
+    volumes:
+      - jira-data:/var/atlassian/application-data/jira
+    environment:
+      # Application memory (replace with yours)
+      JVM_MINIMUM_MEMORY: 8G
+      JVM_MAXIMUM_MEMORY: 8G
+      # Jira URL (replace with yours)
+      ATL_PROXY_NAME: jira.heyvaldemar.net
+      ATL_PROXY_PORT: 443
+      ATL_TOMCAT_SCHEME: https
+      ATL_TOMCAT_SECURE: 'true'
+    networks:
+      - jira-network
+      - traefik-network
+    secrets:
+      - jira-postgres-password
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == worker
+      # Container resources (replace with yours)
+      resources:
+        limits:
+          cpus: '1.55'
+          memory: 10G
+        reservations:
+          cpus: '0.35'
+          memory: 512M
+      labels:
+        - "traefik.enable=true"
+        # Jira URL (replace with yours)
+        - "traefik.http.routers.jira.rule=Host(`jira.heyvaldemar.net`)"
+        - "traefik.http.routers.jira.service=jira"
+        - "traefik.http.routers.jira.entrypoints=websecure"
+        - "traefik.http.services.jira.loadbalancer.server.port=8080"
+        - "traefik.http.routers.jira.tls=true"
+        - "traefik.http.services.jira.loadbalancer.passhostheader=true"
+        - "traefik.http.routers.jira.middlewares=compresstraefik"
+        - "traefik.http.middlewares.compresstraefik.compress=true"
+    depends_on:
+      - postgres
+
+  backups:
+    <<: *default-opts
+    # Image tag (replace with yours)
+    image: postgres:11.11
+    # Database backups prune interval (replace with yours). Default is 7 days.
+    # find /srv/jira-postgres/backups -type f -mtime +7 | xargs rm -f
+
+    # Application data backups prune interval (replace with yours). Default is 7 days.
+    # find /srv/jira-application-data/backups -type f -mtime +7 | xargs rm -f
+
+    # Jira backups interval (replace with yours). Default is 1 day.
+    # sleep 24h
+
+    # Run jira-restore-application-data.sh on the Docker Swarm worker node where the container for backups is running to restore application data if needed.
+    # Run jira-restore-database.sh on the Docker Swarm node where the container for backups is running to restore database if needed.
+    # Run docker stack ps jira | grep jira_backups | awk 'NR > 0 {print $4}' on the Docker Swarm manager node to find on which node container for backups is running.
+    command: sh -c 'sleep 30m
+             && while true; do
+             PGPASSWORD="$$(cat $$POSTGRES_PASSWORD_FILE)"
+             pg_dump
+             -h postgres
+             -p 5432
+             -d jiradb
+             -U jiradbuser | gzip > /srv/jira-postgres/backups/jira-postgres-backup-$$(date "+%Y-%m-%d_%H-%M").gz
+             && tar -zcpf /srv/jira-application-data/backups/jira-application-data-backup-$$(date "+%Y-%m-%d_%H-%M").tar.gz /var/atlassian/application-data/jira
+             && find /srv/jira-postgres/backups -type f -mtime +7 | xargs rm -f
+             && find /srv/jira-application-data/backups -type f -mtime +7 | xargs rm -f;
+             sleep 24h; done'
+    volumes:
+      - jira-data:/var/atlassian/application-data/jira
+      # Application data backups location
+      - jira-data-backups:/srv/jira-application-data/backups
+      # Database backups location
+      - jira-postgres-backups:/srv/jira-postgres/backups
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/jira-postgres-password
+    networks:
+      - jira-network
+    secrets:
+      - jira-postgres-password
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == worker
+      # Container resources (replace with yours)
+      resources:
+        limits:
+          cpus: '0.55'
+          memory: 1G
+        reservations:
+          cpus: '0.35'
+          memory: 512M
+    depends_on:
+      - postgres
+      - jira
